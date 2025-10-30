@@ -1,0 +1,1037 @@
+import os
+import glob
+from pathlib import Path
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import matplotlib.pyplot as plt
+import cv2
+
+def build_backbone(filters=64, training = False):
+    inputs = layers.Input(shape=[512, 512, 3])
+    print("Input layer created")
+
+    def bottleneck_block(x, filters, downsample=False):
+        # ... (bottleneck_block definition remains the same)
+        shortcut = x
+        strides = 2 if downsample else 1
+        
+        # 1x1 Conv
+        x = layers.Conv2D(filters, 1, strides=strides, padding='same', use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        
+        # 3x3 Conv
+        x = layers.Conv2D(filters, 3, padding='same', use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        
+        # 1x1 Conv (Expansion)
+        x = layers.Conv2D(filters * 2, 1, padding='same', use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        
+        # Shortcut Path
+        if downsample or shortcut.shape[-1] != filters * 2:
+            shortcut = layers.Conv2D(filters * 2, 1, strides=strides, padding='same', use_bias=False)(shortcut)
+            shortcut = layers.BatchNormalization()(shortcut)
+            shortcut = layers.ReLU()(shortcut)
+        
+        x = layers.Add()([x, shortcut])
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        
+        return x
+
+
+        lat_convs = [
+        layers.Conv2D(128, 1, padding='same', use_bias=False, name=f'lat_conv_{i}')
+        for i in range(2, 6) # Corresponds to C2, C3, C4, C5
+    ]
+
+    lat_bns = [
+        layers.BatchNormalization(name=f'lat_bn_{i}')
+        for i in range(2, 6)
+    ]
+    
+
+    smooth_convs = [
+        layers.Conv2D(256, 3, padding='same', use_bias=False, name=f'smooth_conv_{i}')
+        for i in range(2, 6)
+    ]
+
+    smooth_bns = [
+        layers.BatchNormalization(name=f'smooth_bn_{i}')
+        for i in range(2, 6)
+    ]
+    
+
+    fuse_bns = [
+        layers.BatchNormalization(name=f'fuse_bn_{i}')
+        for i in range(2, 5) # Corresponds to M2, M3, M4 (fused maps)
+    ]
+
+
+    def FPN_generator(C, M_in=None, idx=0):
+        m1 = lat_convs[idx](C)
+        m1 = lat_bns[idx](m1)
+        m1 = layers.ReLU()(m1)
+        
+
+        if M_in is not None:
+
+            m = layers.Add()([m1, layers.UpSampling2D(size=(2, 2))(M_in)])
+
+            m = fuse_bns[idx-1](m) 
+            m = layers.ReLU()(m)
+        else:
+
+            m = m1
+       
+        p = smooth_convs[idx](m)
+        p = smooth_bns[idx](p)
+        p = layers.ReLU()(p)
+        
+        return p, m
+
+
+    print("Inputs into a conv layer before bottle neck")
+    x = layers.Conv2D(filters, kernel_size=5, strides=2, padding='same', use_bias=False)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPooling2D((2, 2), strides=2, padding='same')(x)
+    c1 = x
+    
+    print("applying bottle neck")
+    c2 = bottleneck_block(c1, filters = 64)
+    c3 = bottleneck_block(c2, filters = 128, downsample = True)
+    c4 = bottleneck_block(c3, filters = 256, downsample = True)
+    c5 = bottleneck_block(c4, filters = 256, downsample = True)
+
+
+    print("generating FPN")
+
+    def fusing(l1, l2):
+        return layers.Add()([l1, layers.UpSampling2D(size=(2, 2))(l2)])
+
+
+
+    p5, m4 = FPN_generator(c5, idx = 0)   
+    p4, m3 = FPN_generator(c4, m4, idx = 1)
+ 
+    p3, m2 = FPN_generator(c3, m3, idx = 2)
+
+    p2, m1 = FPN_generator(c2, m2, idx = 3) 
+
+    p34 = fusing(p3, p4)
+    p45 = fusing(p4, p5)
+    print("Generated FPN now generating the model")
+    return models.Model(inputs=inputs, outputs=[p2, p34, p45], name='FPN')
+
+
+class FCOSModel(tf.keras.Model):
+    def __init__(self, num_classes):
+        super(FCOSModel, self).__init__()
+        self.num_classes = num_classes
+        self.backbone = build_backbone()
+
+
+        def create_head_tower():
+
+            return tf.keras.Sequential([
+                layers.Conv2D(256, 3, padding='same', use_bias=False),
+                layers.BatchNormalization(),
+                layers.ReLU(),
+                layers.Conv2D(256, 3, padding='same', use_bias=False),
+                layers.BatchNormalization(),
+                layers.ReLU(),
+                layers.Conv2D(128, 3, padding='same', use_bias=False),
+                layers.BatchNormalization(),
+                layers.ReLU(),
+                layers.Conv2D(128, 3, padding='same', use_bias=False),
+                layers.BatchNormalization(),
+                layers.ReLU()
+            ])
+
+        # Separate the shared towers for classification and regression
+        self.cls_tower = create_head_tower()
+        self.reg_tower = create_head_tower()
+
+        # 2. Define the Final Prediction Layers
+        # Classification output: (N, H, W, num_classes)
+        self.cls_head = layers.Conv2D(self.num_classes, 3, padding='same', 
+                                      activation='sigmoid', name="Classification")
+        self.reg_head = layers.Conv2D(4, 3, padding='same', 
+                                      activation= None, name="Regression")
+        
+
+        self.ctr_head = layers.Conv2D(1, 3, padding='same', 
+                                      activation='sigmoid', name="Centerness")
+
+
+    def call(self, inputs, training=False): # Add training default
+
+        features = self.backbone(inputs)
+        
+        cls_outputs, reg_outputs, ctr_outputs = [], [], []
+        
+        for f in features:
+            
+            cls_tower_output = self.cls_tower(f)
+            reg_tower_output = self.reg_tower(f)
+
+
+            cls_outputs.append(self.cls_head(cls_tower_output))
+            reg_outputs.append(self.reg_head(reg_tower_output))
+            
+
+            ctr_outputs.append(self.ctr_head(reg_tower_output))
+            return cls_outputs, reg_outputs, ctr_outputs
+
+
+    def gen_tar(self, gt_boxes, batch_size):
+        batch_cls_p2, batch_cls_p3, batch_cls_p4 = [], [], []
+        batch_reg_p2, batch_reg_p3, batch_reg_p4 = [], [], []
+        batch_ctr_p2, batch_ctr_p3, batch_ctr_p4 = [], [], []
+
+
+
+        def target_assignment(gt_boxes_img):
+            p_tar = []     # Assigned pyramid level
+            stride_ = []   # Corresponding stride
+        
+            for box in gt_boxes_img:
+                _, x_min, y_min, x_max, y_max = box
+                width = float(x_max - x_min)
+                height = float(y_max - y_min)
+                area = width * height
+
+
+                if tf.less_equal(area, 5000):
+                    stride_.append(4)
+                    p_tar.append("p2")
+                elif tf.less_equal(area, 50000):
+                    stride_.append(8)
+                    p_tar.append("p3")
+                else:
+                    stride_.append(16)
+                    p_tar.append("p4")
+            return p_tar, stride_
+        
+        
+        '''
+        def center_assignment(p, stride, gt_box, cls_targets, reg_targets, ctr_targets, assigned_area):
+            size = int(512/stride)
+            for i in range(size):
+                for j in range(size):
+                    class_id, x_min, y_min, x_max, y_max  = gt_box
+                    x_img = (i * stride) + stride / 2
+                    y_img = (j * stride) + stride/2
+                    x_center = (x_min + x_max)/2
+                    y_center = (y_min + y_max)/2
+                    radius_x = max(1, 0.6 * (x_max - x_min) / 2)
+                    radius_y = max(1, 0.6 * (y_max - y_min) / 2)
+
+                    box_area = (x_max - x_min) * (y_max - y_min)
+                    if x_img >= x_min and x_img <= x_max and y_img >= y_min and y_img <= y_max:
+                        if abs( x_img - x_center ) <= radius_x and abs( y_img - y_center )<=radius_y:
+                            l = (x_img - x_min) / stride
+                            t = (y_img - y_min) / stride
+                            r = (x_max - x_img) / stride
+                            b = (y_max - y_img) / stride
+        
+                            centerness = tf.sqrt((min(l, r) / max(l, r)) * (min(t, b) / max(t, b)))
+        
+                            if box_area < assigned_area[i, j]:
+                                indices = tf.constant([[i, j]], dtype=tf.int32)
+                                updates = tf.convert_to_tensor([class_id], dtype=tf.int32)
+                                cls_targets = tf.tensor_scatter_nd_update(cls_targets, indices, updates)
+        
+                                
+                                updates = tf.convert_to_tensor([[l, t, r, b]], dtype=tf.float32)
+                                reg_targets = tf.tensor_scatter_nd_update(reg_targets, indices, updates)
+                                
+                                updates = tf.convert_to_tensor([centerness], dtype=tf.float32)
+                                ctr_targets = tf.tensor_scatter_nd_update(ctr_targets, indices, updates)
+                                updates = tf.convert_to_tensor([box_area],dtype = tf.float32)
+                                assigned_area = tf.tensor_scatter_nd_update(assigned_area, indices, updates)
+
+            return cls_targets, reg_targets, ctr_targets, assigned_area'''
+        def center_assignment(p, stride, gt_box, cls_targets, reg_targets, ctr_targets, assigned_area):
+    
+            size = int(512/stride)
+            x_coord, y_coord = tf.range(size, dtype = tf.float32), tf.range(size, dtype = tf.float32)
+            x_grid, y_grid = tf.meshgrid(x_coord, y_coord)
+            class_id, x_min, y_min, x_max, y_max  = gt_box
+            x_img = (x_grid * stride) + stride / 2
+            y_img = (y_grid * stride) + stride/2
+            x_center = ((x_min + x_max) / 2)/ stride
+            y_center = ((y_min + y_max) / 2)/ stride
+            radius_x = max(1, 0.6 * (x_max - x_min) / 2)
+            radius_y = max(1, 0.6 * (y_max - y_min) / 2)
+            in_box_x = (x_img >= x_min) & (x_img <= x_max)
+            in_box_y = (y_img >= y_min) & (y_img <= y_max)
+            in_box = tf.logical_and(in_box_x, in_box_y)
+            rad = tf.logical_and((tf.abs(x_grid - x_center ) <= radius_x), (tf.abs( y_grid - y_center )<=radius_y))
+            indices = tf.logical_and(in_box, rad)
+        
+            l = (x_img - x_min) / stride
+            t = (y_img - y_min) / stride
+            r = (x_max - x_img) / stride
+            b = (y_max - y_img) / stride
+        
+            area = (x_max - x_min) * (y_max - y_min)
+            box_area = tf.fill((size, size), area)
+            box_area = tf.cast(box_area, dtype = tf.float32)
+        
+            assigned_area_nonzero = tf.where(assigned_area == 0, tf.constant(float('inf')), assigned_area)
+            
+            update_mask = tf.logical_and(indices, box_area < assigned_area_nonzero)
+        
+            final_mask = tf.logical_and(indices, update_mask)
+            
+            area = tf.boolean_mask(box_area, final_mask)
+            
+            cls = tf.fill((size, size), class_id)
+            cls = tf.cast(cls, dtype = tf.int32)
+            cls = tf.boolean_mask(cls, final_mask)
+        
+            
+            ltrb = tf.stack([l, t, r, b], axis = 2)
+            reg = tf.boolean_mask(ltrb, final_mask)
+            
+            centerness = tf.sqrt((tf.minimum(l, r) / tf.maximum(l, r)) * (tf.minimum(t, b) / tf.maximum(t, b)))
+            centerness = tf.boolean_mask(centerness, final_mask)
+        
+            indices = tf.where(final_mask)
+            
+            cls_targets = cls_targets.scatter_nd_update(indices, cls)
+            reg_targets = reg_targets.scatter_nd_update(indices, reg)
+            ctr_targets = ctr_targets.scatter_nd_update(indices, centerness)
+            assigned_area = assigned_area.scatter_nd_update(indices, area)
+            return cls_targets, reg_targets, ctr_targets, assigned_area
+        
+        
+        
+            
+        for img in range(len(gt_boxes)):
+        
+            size_p2 = int(512/4)  #128
+            cls_targets_p2 = tf.Variable(tf.zeros((size_p2, size_p2), dtype=tf.int32))
+            reg_targets_p2 = tf.Variable(tf.zeros((size_p2, size_p2, 4), dtype=tf.float32))
+            ctr_targets_p2 = tf.Variable(tf.zeros((size_p2, size_p2), dtype=tf.float32))
+            assigned_area_p2 = tf.Variable(tf.cast(tf.fill([size_p2, size_p2], float('inf')), dtype=tf.float32))
+            
+        
+            size_p3 = int(512/8) #64
+            cls_targets_p3 = tf.Variable(tf.zeros((size_p3, size_p3), dtype=tf.int32))
+            reg_targets_p3 = tf.Variable(tf.zeros((size_p3, size_p3, 4), dtype=tf.float32))
+            ctr_targets_p3 = tf.Variable(tf.zeros((size_p3, size_p3), dtype=tf.float32))
+            assigned_area_p3 = tf.Variable(tf.cast(tf.fill([size_p3, size_p3], float('inf')), dtype=tf.float32))
+            
+        
+            size_p4 = int(512/16) #32
+            cls_targets_p4 = tf.Variable(tf.zeros((size_p4, size_p4), dtype=tf.int32))
+            reg_targets_p4 = tf.Variable(tf.zeros((size_p4, size_p4, 4), dtype=tf.float32))
+            ctr_targets_p4 = tf.Variable(tf.zeros((size_p4, size_p4), dtype=tf.float32))
+            assigned_area_p4 = tf.Variable(tf.cast(tf.fill([size_p4, size_p4], float('inf')), dtype=tf.float32))
+        
+        
+            
+            p_tar, stride_ = target_assignment(gt_boxes[img])
+
+        
+            for p, st, gt_box in zip(p_tar, stride_, gt_boxes[img]):
+                
+                match st:
+                    case 4:
+                        cls_targets_p2, reg_targets_p2, ctr_targets_p2, assigned_area_p2 = center_assignment(p, st, gt_box, cls_targets_p2, reg_targets_p2, ctr_targets_p2, assigned_area_p2)
+                    case 8:
+                        cls_targets_p3, reg_targets_p3, ctr_targets_p3, assigned_area_p3 = center_assignment(p, st, gt_box, cls_targets_p3, reg_targets_p3, ctr_targets_p3, assigned_area_p3)
+                    case 16:
+                        cls_targets_p4, reg_targets_p4, ctr_targets_p4, assigned_area_p4 = center_assignment(p, st, gt_box, cls_targets_p4, reg_targets_p4, ctr_targets_p4, assigned_area_p4)
+
+            batch_cls_p2.append(cls_targets_p2)
+            batch_cls_p3.append(cls_targets_p3)
+            batch_cls_p4.append(cls_targets_p4)
+
+        
+        
+            batch_reg_p2.append(reg_targets_p2)
+            batch_reg_p3.append(reg_targets_p3)
+            batch_reg_p4.append(reg_targets_p4)
+
+            
+            batch_ctr_p2.append(ctr_targets_p2)
+            batch_ctr_p3.append(ctr_targets_p3)
+            batch_ctr_p4.append(ctr_targets_p4)
+            
+        
+        cls_p2 = tf.stack(batch_cls_p2)
+        cls_p3 = tf.stack(batch_cls_p3)
+        cls_p4 = tf.stack(batch_cls_p4)
+
+        
+        
+        reg_p2 = tf.stack(batch_reg_p2)
+        reg_p3 = tf.stack(batch_reg_p3)
+        reg_p4 = tf.stack(batch_reg_p4)
+
+        
+        ctr_p2 = tf.stack(batch_ctr_p2)
+        ctr_p3 = tf.stack(batch_ctr_p3)
+        ctr_p4 = tf.stack(batch_ctr_p4)
+
+        
+        cls_stack = [cls_p2, cls_p3, cls_p4]
+        reg_stack = [reg_p2, reg_p3, reg_p4]
+        ctr_stack = [ctr_p2, ctr_p3, ctr_p4]
+
+        return cls_stack, reg_stack, ctr_stack
+
+
+    def losses(self, cls_out, reg_out, ctr_out, cls_stack, reg_stack, ctr_stack, batch_size):
+        STRIDES = [4.0, 8.0, 16.0] 
+        def focal_loss(cls_out, cls_target, num_classes, alpha=0.25, gamma=2.0):
+            coords = tf.where(cls_target > 0)
+            if tf.shape(coords)[0] == 0:
+                return tf.constant(0.0)
+            
+            class_ids = tf.gather_nd(cls_target, coords)
+            pred_logits = tf.gather_nd(cls_out, coords)
+        
+            class_id_shifted = tf.cast(class_ids - 1, tf.int32)
+            target_one_hot = tf.one_hot(class_id_shifted, depth=num_classes, dtype=tf.float32)
+        
+            pred_prob = tf.sigmoid(pred_logits)
+            if num_classes == 1:
+                pt = pred_prob  # shape [num_objects]
+            else:
+                indices = tf.stack([tf.range(tf.shape(class_ids)[0]), class_id_shifted], axis=1)
+                pt = tf.gather_nd(pred_prob, indices)
+        
+            focal_weight = alpha * tf.pow(1 - pt, gamma)
+            bce = tf.keras.losses.binary_crossentropy(target_one_hot, pred_prob)
+            loss = focal_weight * bce
+            
+            return tf.reduce_mean(loss)
+
+
+        def iou_loss(reg_out, reg_target, cls_target, stride):  
+            foreground_mask = tf.reduce_max(cls_target, axis=-1) > 0  # shape [H, W]
+        
+            H, W = tf.shape(reg_target)[0], tf.shape(reg_target)[1]
+            x_coords, y_coords = tf.meshgrid(tf.range(W), tf.range(H))
+        
+            # Scale coordinates to absolute pixel locations
+            x_coords = tf.cast(x_coords, tf.float32) * stride + stride / 2
+            y_coords = tf.cast(y_coords, tf.float32) * stride + stride / 2
+        
+            coords = tf.stack([x_coords, y_coords], axis=-1)  # [H, W, 2]
+        
+            if tf.reduce_sum(tf.cast(foreground_mask, tf.int32)) == 0:
+                return tf.reduce_sum(reg_out) * 0.0
+        
+            # Convert [l, t, r, b] to [x_min, y_min, x_max, y_max]
+            def ltrb_to_box(ltrb, coords):
+                l, t, r, b = tf.unstack(ltrb, axis=-1)
+                x = coords[..., 0]
+                y = coords[..., 1]
+                x_min = x - l
+                y_min = y - t
+                x_max = x + r
+                y_max = y + b
+                return tf.stack([x_min, y_min, x_max, y_max], axis=-1)
+        
+            pred_box = ltrb_to_box(reg_out, coords)
+            target_box = ltrb_to_box(reg_target, coords)
+        
+            pred_box_fg = tf.boolean_mask(pred_box, foreground_mask)
+            target_box_fg = tf.boolean_mask(target_box, foreground_mask)
+        
+            x_left = tf.maximum(pred_box_fg[:, 0], target_box_fg[:, 0])
+            y_top = tf.maximum(pred_box_fg[:, 1], target_box_fg[:, 1])
+            x_right = tf.minimum(pred_box_fg[:, 2], target_box_fg[:, 2])
+            y_bottom = tf.minimum(pred_box_fg[:, 3], target_box_fg[:, 3])
+        
+            inter_area = tf.maximum(0.0, x_right - x_left) * tf.maximum(0.0, y_bottom - y_top)
+            pred_area = (pred_box_fg[:, 2] - pred_box_fg[:, 0]) * (pred_box_fg[:, 3] - pred_box_fg[:, 1])
+            target_area = (target_box_fg[:, 2] - target_box_fg[:, 0]) * (target_box_fg[:, 3] - target_box_fg[:, 1])
+            union_area = pred_area + target_area - inter_area
+        
+            iou = inter_area / (union_area + 1e-6)
+            loss = 1.0 - iou
+            return tf.reduce_mean(loss)
+
+
+        
+        def bce_loss(ctr_out, ctr_target, cls_target):
+            coord = tf.where(cls_target > 0)
+                
+        
+            if tf.shape(coord)[0] == 0:
+                return tf.constant(0.0)
+                
+            ctr_out = tf.gather_nd(ctr_out, coord)
+            ctr_target = tf.gather_nd(ctr_target, coord)
+        
+            ctr_target = tf.reshape(ctr_target, [-1, 1])
+            ctr_out = tf.reshape(ctr_out, [-1, 1])
+                
+            bce = tf.keras.losses.binary_crossentropy(ctr_target, ctr_out)
+        
+            return tf.reduce_mean(bce)
+                
+                
+        num_classes = self.num_classes
+        cls_loss, reg_loss, ctr_loss = [], [], []
+        for i in range(batch_size):
+            for level in range(3):
+                cls_target = tf.gather(cls_stack[level],i)
+                cls_pred = tf.gather(cls_out[level],i)
+                loss = focal_loss(cls_pred, cls_target, num_classes)
+                cls_loss.append(tf.reduce_mean(loss))
+
+        #cls_loss = [tf.cast(l, tf.float32) for l in cls_loss]
+        cls_ten = tf.stack(cls_loss)                   # Convert list to tensor
+        non_zero_mask = cls_ten > 0                    # Mask out zeros
+        cls = tf.boolean_mask(cls_ten, non_zero_mask)  # Mean of non-zero losses
+        
+        cls = tf.cond(
+            tf.size(cls) > 0,
+            lambda: tf.reduce_mean(cls),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        tf.print("Classification loss :", cls)
+
+
+        for i in range(batch_size):
+            for level in range(3):
+                reg_target = tf.gather(reg_stack[level], i)   # [H, W, 4]
+                reg_pred = tf.gather(reg_out[level], i)       # [H, W, 4]
+                cls_target = tf.gather(cls_stack[level], i)   # [H, W, C]
+                stride = STRIDES[level]
+        
+                loss = iou_loss(reg_pred, reg_target, cls_target, stride)
+                reg_loss.append(loss)
+        
+        # After the loop ends
+        #reg_loss = [tf.cast(l, tf.float32) for l in reg_loss]
+
+        reg_ten = tf.stack(reg_loss)                   # Convert list to tensor
+        non_zero_mask = reg_ten > 0                    # Mask out zeros
+        reg = tf.boolean_mask(reg_ten, non_zero_mask)  # Mean of non-zero losses
+        
+        reg = tf.cond(
+            tf.size(reg) > 0,
+            lambda: tf.reduce_mean(reg),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        
+        tf.print("Regression loss (non-zero mean) :", reg)
+
+        for i in range(batch_size):
+            for level in range(3):
+                ctr_target = tf.gather(ctr_stack[level], i) 
+                ctr_pred = tf.gather(ctr_out[level], i)     
+                cls_target = tf.gather(cls_stack[level], i)  
+                loss = bce_loss(ctr_pred, ctr_target, cls_target)
+                ctr_loss.append(loss)
+                
+        #ctr_loss = [tf.cast(l, tf.float32) for l in ctr_loss]
+        ctr_ten = tf.stack(ctr_loss)                   # Convert list to tensor
+        non_zero_mask = ctr_ten > 0                    # Mask out zeros
+        ctr = tf.boolean_mask(ctr_ten, non_zero_mask)  # Mean of non-zero losses
+        
+        ctr = tf.cond(
+            tf.size(ctr) > 0,
+            lambda: tf.reduce_mean(ctr),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        tf.print("Center loss :", ctr)
+
+        return cls, reg, ctr
+
+
+
+    def val_losses(self, cls_out, reg_out, ctr_out, cls_stack, reg_stack, ctr_stack, batch_size):
+        STRIDES = [4.0, 8.0, 16.0, 32.0, 64.0] 
+        def val_focal_loss(cls_out, cls_target, num_classes, alpha=0.25, gamma=2.0):
+            coords = tf.where(cls_target > 0)
+            if tf.shape(coords)[0] == 0:
+                return tf.constant(0.0)
+            
+            class_ids = tf.gather_nd(cls_target, coords)
+            pred_logits = tf.gather_nd(cls_out, coords)
+        
+            class_id_shifted = tf.cast(class_ids - 1, tf.int32)
+            target_one_hot = tf.one_hot(class_id_shifted, depth=num_classes, dtype=tf.float32)
+        
+            pred_prob = tf.sigmoid(pred_logits)
+            if num_classes == 1:
+                pt = pred_prob  # shape [num_objects]
+            else:
+                indices = tf.stack([tf.range(tf.shape(class_ids)[0]), class_id_shifted], axis=1)
+                pt = tf.gather_nd(pred_prob, indices)
+        
+            focal_weight = alpha * tf.pow(1 - pt, gamma)
+            bce = tf.keras.losses.binary_crossentropy(target_one_hot, pred_prob)
+            loss = focal_weight * bce
+            
+            return tf.reduce_mean(loss)
+
+
+
+        def val_iou_loss(reg_out, reg_target, cls_target, stride):  # 👈 ADD 'stride'
+            foreground_mask = tf.reduce_max(cls_target, axis=-1) > 0  # shape [H, W]
+        
+            H, W = tf.shape(reg_target)[0], tf.shape(reg_target)[1]
+            x_coords, y_coords = tf.meshgrid(tf.range(W), tf.range(H))
+        
+            # Scale coordinates to absolute pixel locations
+            x_coords = tf.cast(x_coords, tf.float32) * stride + stride / 2
+            y_coords = tf.cast(y_coords, tf.float32) * stride + stride / 2
+        
+            coords = tf.stack([x_coords, y_coords], axis=-1)  # [H, W, 2]
+        
+            if tf.reduce_sum(tf.cast(foreground_mask, tf.int32)) == 0:
+                return tf.reduce_sum(reg_out) * 0.0
+        
+            # Convert [l, t, r, b] to [x_min, y_min, x_max, y_max]
+            def ltrb_to_box(ltrb, coords):
+                l, t, r, b = tf.unstack(ltrb, axis=-1)
+                x = coords[..., 0]
+                y = coords[..., 1]
+                x_min = x - l
+                y_min = y - t
+                x_max = x + r
+                y_max = y + b
+                return tf.stack([x_min, y_min, x_max, y_max], axis=-1)
+        
+            pred_box = ltrb_to_box(reg_out, coords)
+            target_box = ltrb_to_box(reg_target, coords)
+        
+            pred_box_fg = tf.boolean_mask(pred_box, foreground_mask)
+            target_box_fg = tf.boolean_mask(target_box, foreground_mask)
+        
+            x_left = tf.maximum(pred_box_fg[:, 0], target_box_fg[:, 0])
+            y_top = tf.maximum(pred_box_fg[:, 1], target_box_fg[:, 1])
+            x_right = tf.minimum(pred_box_fg[:, 2], target_box_fg[:, 2])
+            y_bottom = tf.minimum(pred_box_fg[:, 3], target_box_fg[:, 3])
+        
+            inter_area = tf.maximum(0.0, x_right - x_left) * tf.maximum(0.0, y_bottom - y_top)
+            pred_area = (pred_box_fg[:, 2] - pred_box_fg[:, 0]) * (pred_box_fg[:, 3] - pred_box_fg[:, 1])
+            target_area = (target_box_fg[:, 2] - target_box_fg[:, 0]) * (target_box_fg[:, 3] - target_box_fg[:, 1])
+            union_area = pred_area + target_area - inter_area
+        
+            iou = inter_area / (union_area + 1e-6)
+            loss = iou
+            return tf.reduce_mean(loss)
+
+
+        
+        def val_bce_loss(ctr_out, ctr_target, cls_target):
+            coord = tf.where(cls_target > 0)
+                
+        
+            if tf.shape(coord)[0] == 0:
+                return tf.constant(0.0)
+                
+            ctr_out = tf.gather_nd(ctr_out, coord)
+            ctr_target = tf.gather_nd(ctr_target, coord)
+        
+            ctr_target = tf.reshape(ctr_target, [-1, 1])
+            ctr_out = tf.reshape(ctr_out, [-1, 1])
+                
+            bce = tf.keras.losses.binary_crossentropy(ctr_target, ctr_out)
+        
+            return tf.reduce_mean(bce)
+                
+                
+        num_classes = self.num_classes
+        cls_loss, reg_loss, ctr_loss = [], [], []
+        for i in range(batch_size):
+            for level in range(3):
+                cls_target = tf.gather(cls_stack[level],i)
+                cls_pred = tf.gather(cls_out[level],i)
+                loss = val_focal_loss(cls_pred, cls_target, num_classes)
+                cls_loss.append(tf.reduce_mean(loss))
+
+        #cls_loss = [tf.cast(l, tf.float32) for l in cls_loss]
+
+        cls_ten = tf.stack(cls_loss)                   # Convert list to tensor
+        non_zero_mask = cls_ten > 0                    # Mask out zeros
+        cls = tf.boolean_mask(cls_ten, non_zero_mask)  # Mean of non-zero losses
+        
+        cls = tf.cond(
+            tf.size(cls) > 0,
+            lambda: tf.reduce_mean(cls),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        tf.print("Val_Classification loss :", cls)
+
+
+        for i in range(batch_size):
+            for level in range(3):
+                reg_target = tf.gather(reg_stack[level], i)   # [H, W, 4]
+                reg_pred = tf.gather(reg_out[level], i)       # [H, W, 4]
+                cls_target = tf.gather(cls_stack[level], i)   # [H, W, C]
+                stride = STRIDES[level]
+        
+                loss = val_iou_loss(reg_pred, reg_target, cls_target, stride)
+                reg_loss.append(loss)
+        
+        # After the loop ends
+        #reg_loss = [tf.cast(l, tf.float32) for l in reg_loss]
+        reg_ten = tf.stack(reg_loss)                   # Convert list to tensor
+        non_zero_mask = reg_ten > 0                    # Mask out zeros
+        reg = tf.boolean_mask(reg_ten, non_zero_mask)  # Mean of non-zero losses
+        
+        reg = tf.cond(
+            tf.size(reg) > 0,
+            lambda: tf.reduce_mean(reg),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        
+        tf.print("Val_Regression loss (non-zero mean) :", reg)
+
+        for i in range(batch_size):
+            for level in range(3):
+                ctr_target = tf.gather(ctr_stack[level], i) 
+                ctr_pred = tf.gather(ctr_out[level], i)     
+                cls_target = tf.gather(cls_stack[level], i)  
+                loss = val_bce_loss(ctr_pred, ctr_target, cls_target)
+                ctr_loss.append(loss)
+        #ctr_loss = [tf.cast(l, tf.float32) for l in ctr_loss]
+        ctr_ten = tf.stack(ctr_loss)                   # Convert list to tensor
+        non_zero_mask = ctr_ten > 0                    # Mask out zeros
+        ctr = tf.boolean_mask(ctr_ten, non_zero_mask)  # Mean of non-zero losses
+        
+        ctr = tf.cond(
+            tf.size(ctr) > 0,
+            lambda: tf.reduce_mean(ctr),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        tf.print("Val_Center loss :", ctr)
+
+        return cls, reg, ctr
+
+
+
+from datetime import datetime
+st_time = datetime.now()
+def letter_box(img_path, bboxes, target = 512):
+    img = cv2.imread(img_path)
+    h, w = img.shape[:2]
+
+    scale = min(target/h, target/w)
+    new_h, new_w = int(round(h* scale)), int(round(w * scale))
+    lh, lw = target - new_h, target - new_w
+    pad_top = lh//2
+    pad_bottom = lh - pad_top
+    pad_left = lw//2
+    pad_right = lw - pad_left
+    img = cv2.resize(img, (new_w , new_h))
+    img = cv2.copyMakeBorder(img, pad_top, pad_bottom, pad_left, pad_right, borderType = cv2.BORDER_CONSTANT, value = (114, 114, 114))
+    annot = []
+    for i in range(len(bboxes)):
+        class_id, x, y, width, height = bboxes[i]
+        x, y, width, height = x * w, y * h, width * w, height * h
+        x_min, x_max, y_min, y_max = x - width/4, x + width, y - height/4, y + height
+        x_min, x_max, y_min, y_max = int(round((x_min * scale) + pad_left)), int(round((x_max * scale )+ pad_left)), int(round((y_min * scale) + pad_top)), int(round((y_max * scale ) + pad_top))
+        annot.append([int(class_id), x_min, y_min, x_max, y_max])
+    return img, annot
+
+
+image_dir = Path('train_images')
+annotation_dir = Path('dataset/train_labels')
+
+val_dir = Path('val_images')
+val_annot = Path('dataset/val_labels')
+
+dataset = []
+val_dataset = []
+
+
+image_paths = sorted(list(image_dir.glob('*.jpg')) + list(image_dir.glob('*.png')))
+val_img_paths = sorted(list(val_dir.glob('*.jpg')) + list(val_dir.glob('*.png')))
+
+# Training Dataset creation
+
+for img_path in image_paths:
+
+    name = Path(img_path).stem
+    ann_path = annotation_dir / f"{name}.txt"
+
+    if not os.path.exists(ann_path):
+        continue 
+
+    bboxes = []
+    with open(ann_path, 'r') as f:
+        lines = f.readlines()
+        if len(lines) == 0:
+            continue
+        for line in lines:
+            parts = line.strip().split()
+            if parts[0] in ['1']:
+                bboxes.append(list(map(float,parts)))
+    if len(bboxes) == 0:
+        continue
+    img, bboxes = letter_box(img_path, bboxes)
+    bbox = tf.ragged.constant(bboxes, dtype = tf.float32)
+    with tf.device('/CPU:0'):
+        img = tf.convert_to_tensor(img, dtype=tf.float32)
+    dataset.append((img, bbox))
+    
+# Validation dataset creation
+
+for img_path in val_img_paths:
+
+    name = Path(img_path).stem
+    ann_path = val_annot / f"{name}.txt"
+
+    if not os.path.exists(ann_path):
+        
+        continue 
+
+    
+    bboxes = []
+    with open(ann_path, 'r') as f:
+        lines = f.readlines()
+        if len(lines) == 0:
+            continue
+        for line in lines:
+            parts = line.strip().split()
+
+            if parts[0] in ['1']:
+            
+                bboxes.append(list(map(float,parts)))
+    if len(bboxes) == 0:
+        continue
+    img, bboxes = letter_box(img_path, bboxes)
+    bbox = tf.ragged.constant(bboxes, dtype = tf.float32)
+    img = img.astype(np.float32)
+    with tf.device('/CPU:0'):
+        img = tf.convert_to_tensor(img, dtype=tf.float32)
+    val_dataset.append((img, bbox))
+cur_time = datetime.now()
+print(f"Annotations bbox convertion and dataset to tensor completed for training and validation in {(cur_time - st_time).total_seconds() } seconds")
+
+
+
+batch_size = 4
+val_batch_size = 4
+
+
+def generator():
+    for image, bbox in dataset:
+        yield image, bbox
+
+output_signature = (
+    tf.TensorSpec(shape=(512, 512, 3), dtype=tf.float32),
+    tf.RaggedTensorSpec(shape=(None, 5), dtype=tf.float32)       
+)
+
+ds = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
+ds = ds.batch(batch_size)
+
+
+
+
+def generators():
+    for image, bbox in val_dataset:
+        yield image, bbox
+
+
+val_ds = tf.data.Dataset.from_generator(generators, output_signature=output_signature)
+val_ds = val_ds.batch(val_batch_size)
+
+ds = ds.prefetch(tf.data.AUTOTUNE)
+val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
+
+
+# 1. Instantiate model and optimizer
+model = FCOSModel(num_classes=1)
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+
+# Simulate FPN outputs for each level
+dummy_features = [
+    tf.random.uniform((1, 128, 128, 256)),
+    tf.random.uniform((1, 64, 64, 256)),
+    tf.random.uniform((1, 32, 32, 256)),
+]
+
+# Pass through towers to force build
+for f in dummy_features:
+    _ = model.cls_tower(f)
+    _ = model.reg_tower(f)
+
+# 2. Prepare dummy image batch (B=4, H=416, W=416, C=3)
+dummy_img = tf.zeros([4, 512, 512, 3], dtype=tf.float32)
+
+# 3. Prepare dummy ground truth boxes (1 box per image)
+# Format: [class_id, x_min, y_min, x_max, y_max]
+dummy_gt = tf.ragged.constant([
+    [[1.0, 50.0, 50.0, 300.0, 300.0]],
+    [[1.0, 100.0, 100.0, 300.0, 300.0]],
+    [[1.0, 20.0, 20.0, 50.0, 50.0]],
+    [[1.0, 50.0, 50.0, 400.0, 400.0]]
+], dtype=tf.float32)
+
+# Optional: Convert to dense if your gen_tar expects dense tensors
+dense_gt = dummy_gt.to_tensor(default_value=-1.0)
+
+# 4. Force model build with dummy input
+_ = model(dummy_img, training=True)
+
+print("--- Building all model and optimizer variables on first batch ---")
+
+# 5. Run warm-up pass to initialize optimizer slots
+with tf.GradientTape(watch_accessed_variables=False) as tape:
+    # Forward pass
+    cls_preds, reg_preds, ctr_preds = model(dummy_img, training=True)
+
+    # Target generation
+    cls_targets, reg_targets, ctr_targets = model.gen_tar(dummy_gt, batch_size=1)
+
+    # Loss computation
+    cls_loss, reg_loss, ctr_loss = model.losses(
+        cls_preds, reg_preds, ctr_preds,
+        cls_targets, reg_targets, ctr_targets,
+        batch_size=1
+    )
+    total_loss = cls_loss + reg_loss + ctr_loss
+for v in model.trainable_variables:
+    if not isinstance(v, tf.Variable):
+        print("Tensor (not Variable):", type(v), getattr(v, 'name', 'No name'))
+
+
+# 6. Apply gradients (zero-safe)
+grads = tape.gradient(total_loss, model.trainable_variables)
+zero_grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, model.trainable_variables)]
+optimizer.apply_gradients(zip(zero_grads, model.trainable_variables))
+
+print("--- Variable build complete. Starting main training. ---")
+
+gpus = tf.config.list_physical_devices('GPU')
+
+if gpus:
+    print("GPU(s) detected by TensorFlow:")
+    for gpu in gpus:
+        print("  •", gpu)
+    print("\nDefault device:", tf.test.gpu_device_name())
+else:
+    print("No GPU detected. TensorFlow is using CPU.")
+
+
+best_loss = float('inf')
+patience_counter = 0
+patience = 3       # Number of epochs to wait before reducing LR
+min_lr = 1e-6      # Minimum learning rate
+lr_factor = 0.5
+cls_log = []
+reg_log = []
+ctr_log = []
+batch_log = []
+epoch_log = []
+
+epochs = 20
+def snapshot_vars(stage):
+    return set(v.name for v in model.trainable_variables), stage
+
+q = 0
+tf.print("Training Started")
+for epoch in range(epochs):
+    epoch_time = datetime.now()
+    val_loss = tf.constant(0.0)
+    p = 0
+    epoch_loss = 0.0
+    l = 0
+    for inputs, gt_boxes in ds:
+        '''
+        if l >= lim:
+            break
+        l +=1
+        '''
+        batch_time = datetime.now()
+        before, stage_before = snapshot_vars("Before model call")
+
+
+        with tf.GradientTape() as tape:
+            #stm = datetime.now()
+            A, B, C = model(inputs, training=True)
+            #curm = datetime.now()
+            #tf.print(f"Time taken for the model layers to give output : {curm - stm}")
+            #stm = datetime.now()
+            a, b, c = model.gen_tar(gt_boxes, batch_size)
+            #curm = datetime.now()
+            #tf.print(f"Time taken for the model generate targets : {curm - stm}")
+            #stm = datetime.now()
+            cls, reg, ctr = model.losses(A, B, C, a, b, c, batch_size)
+            #curm = datetime.now()
+            #tf.print(f"Time taken for the model loss fucntions to give losses : {curm - stm}")
+            cls_log.append(cls)
+            reg_log.append(reg)
+            ctr_log.append(ctr)
+            total_loss = cls + reg + ctr
+            batch_log.append(total_loss)
+            
+
+            
+
+        after, stage_after = snapshot_vars("After model call")
+
+
+        new_vars = after - before
+        if new_vars:
+            tf.print(f"New variables created between {stage_before} and {stage_after}:")
+            for v in new_vars:
+                tf.print(v.name, v.shape)
+        grads = tape.gradient(total_loss, model.trainable_variables)
+        zero_grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, model.trainable_variables)]
+        grads_vars = list(zip(zero_grads, model.trainable_variables))
+
+
+
+        optimizer.apply_gradients(grads_vars)
+
+        epoch_loss += total_loss
+        batch_loss = total_loss
+    # Track best loss and adjust learning rate manually
+        cur_time = datetime.now()
+        tf.print(f"Batch loss{p}: {batch_loss}")
+        tf.print(f"TimeTaken : {(cur_time - batch_time).total_seconds()} seconds")
+        tf.print(f"End of batch {p}/n/n")
+        tf.print("-----------------------------------------------------------------")
+        p += 1
+    l = 0
+    for i, j in val_ds:
+        '''
+        if l >= lim//2:
+            break
+        l+=1
+        '''
+        A_, B_, C_ = model(i, training=False)
+        a_, b_, c_ = model.gen_tar(j, val_batch_size)
+        cls_, reg_, ctr_ = model.val_losses(A_, B_, C_, a_, b_, c_, val_batch_size)
+        val_loss += cls_ + reg_ + ctr_
+        tf.print("-----------------------------------------------------------------")
+    current_loss = epoch_loss
+    
+    if current_loss < best_loss:
+        best_loss = current_loss
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            new_lr = max(optimizer.learning_rate.numpy() * lr_factor, min_lr)
+            optimizer.learning_rate.assign(new_lr)
+            print(f"Reducing learning rate to {new_lr}")
+            patience_counter = 0
+            
+    tf.print("Epoch loss: ", epoch_loss/ len(dataset))
+    epoch_log.append(epoch_loss/len(dataset))
+    cur_time = datetime.now()
+    tf.print(f"Time Taken for Epoch {q} : {(cur_time - epoch_time).total_seconds()} seconds")
+    tf.print(f"\nEnd of the epoch {q}...........")
+    q += 1
